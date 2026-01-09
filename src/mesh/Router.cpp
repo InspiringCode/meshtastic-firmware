@@ -734,7 +734,9 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
 {
     bool skipHandle = false;
     // Also, we should set the time from the ISR and it should have msec level resolution
-    p->rx_time = getValidTime(RTCQualityFromNet); // store the arrival timestamp for the phone
+    if (p->rx_time == 0) {
+        p->rx_time = getValidTime(RTCQualityFromNet); // store the arrival timestamp for the phone
+    }
 
     // Store a copy of encrypted packet for MQTT
     DEBUG_HEAP_BEFORE;
@@ -808,57 +810,77 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
 #endif
     }
 
+    // Forward handled packets to the phone from the Router layer so we don't depend on
+    // routing/module filters (broadcast/toUs) for observability.
+    // NOTE: We must enqueue a copy because the caller will release `p` after return.
+    if (service) {
+        DEBUG_HEAP_BEFORE;
+        auto copyForPhone = packetPool.allocCopy(*p);
+        DEBUG_HEAP_AFTER("Router::handleReceived(toPhone)", copyForPhone);
+        service->sendToPhone(copyForPhone);
+    }
+
     packetPool.release(p_encrypted); // Release the encrypted packet
     p_encrypted = nullptr;
 }
 
 void Router::perhapsHandleReceived(meshtastic_MeshPacket *p)
 {
+    // Record the arrival timestamp for the phone. (On some targets this would ideally be set in the ISR.)
+    p->rx_time = getValidTime(RTCQualityFromNet);
+
 #if ENABLE_JSON_LOGGING
     // Even ignored packets get logged in the trace
-    p->rx_time = getValidTime(RTCQualityFromNet); // store the arrival timestamp for the phone
     LOG_TRACE("%s", MeshPacketSerializer::JsonSerializeEncrypted(p).c_str());
 #elif ARCH_PORTDUINO
     // Even ignored packets get logged in the trace
     if (portduino_config.traceFilename != "" || portduino_config.logoutputlevel == level_trace) {
-        p->rx_time = getValidTime(RTCQualityFromNet); // store the arrival timestamp for the phone
         LOG_TRACE("%s", MeshPacketSerializer::JsonSerializeEncrypted(p).c_str());
     }
 #endif
+
+    bool shouldHandle = true;
     // assert(radioConfig.has_preferences);
     if (is_in_repeated(config.lora.ignore_incoming, p->from)) {
         LOG_DEBUG("Ignore msg, 0x%x is in our ignore list", p->from);
-        packetPool.release(p);
-        return;
+        shouldHandle = false;
     }
 
     meshtastic_NodeInfoLite const *node = nodeDB->getMeshNode(p->from);
-    if (node != NULL && node->is_ignored) {
+    if (shouldHandle && node != NULL && node->is_ignored) {
         LOG_DEBUG("Ignore msg, 0x%x is ignored", p->from);
-        packetPool.release(p);
-        return;
+        shouldHandle = false;
     }
 
-    if (p->from == NODENUM_BROADCAST) {
+    if (shouldHandle && p->from == NODENUM_BROADCAST) {
         LOG_DEBUG("Ignore msg from broadcast address");
-        packetPool.release(p);
-        return;
+        shouldHandle = false;
     }
 
-    if (config.lora.ignore_mqtt && p->via_mqtt) {
+    if (shouldHandle && config.lora.ignore_mqtt && p->via_mqtt) {
         LOG_DEBUG("Msg came in via MQTT from 0x%x", p->from);
-        packetPool.release(p);
-        return;
+        shouldHandle = false;
     }
 
-    if (shouldFilterReceived(p)) {
+    if (shouldHandle && shouldFilterReceived(p)) {
         LOG_DEBUG("Incoming msg was filtered from 0x%x", p->from);
-        packetPool.release(p);
-        return;
+        shouldHandle = false;
     }
 
     // Note: we avoid calling shouldFilterReceived if we are supposed to ignore certain nodes - because some overrides might
     // cache/learn of the existence of nodes (i.e. FloodRouter) that they should not
-    handleReceived(p);
+    if (shouldHandle) {
+        handleReceived(p);
+    } else {
+        // Forward ignored/filtered packets to the phone too.
+        // Try to decode first so the phone/logger can see decoded packets when possible.
+        if (service) {
+            DEBUG_HEAP_BEFORE;
+            auto copyForPhone = packetPool.allocCopy(*p);
+            DEBUG_HEAP_AFTER("Router::perhapsHandleReceived(toPhone)", copyForPhone);
+            (void)perhapsDecode(copyForPhone);
+            service->sendToPhone(copyForPhone);
+        }
+    }
     packetPool.release(p);
 }

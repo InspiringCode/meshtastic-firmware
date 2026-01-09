@@ -93,6 +93,9 @@ class MeshService
 
     static bool isTextPayload(const meshtastic_MeshPacket *p)
     {
+        if (!p || p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+            return false;
+        }
         if (moduleConfig.range_test.enabled && p->decoded.portnum == meshtastic_PortNum_RANGE_TEST_APP) {
             return true;
         }

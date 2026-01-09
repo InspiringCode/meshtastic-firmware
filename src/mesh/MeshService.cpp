@@ -109,8 +109,9 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
         }
     }
 
-    printPacket("Forwarding to phone", mp);
-    sendToPhone(packetPool.allocCopy(*mp));
+    // Router forwards packets to the phone (including ignored/filtered).
+    // Keep handleFromRadio() for DB updates and any automatic responses.
+    printPacket("handleFromRadio", mp);
 
     return 0;
 }
@@ -303,12 +304,18 @@ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
 
 void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 {
+    if (!p) {
+        LOG_WARN("sendToPhone called with null packet");
+        return;
+    }
+
     perhapsDecode(p);
+    const bool isDecoded = (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag);
 
 #ifdef ARCH_ESP32
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
     if (moduleConfig.store_forward.enabled && storeForwardModule->isServer() &&
-        p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        isDecoded && p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
         releaseToPool(p); // Copy is already stored in StoreForward history
         fromNum++;        // Notify observers for packet from radio
         return;
@@ -317,8 +324,8 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 #endif
 
     if (toPhoneQueue.numFree() == 0) {
-        if (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
-            p->decoded.portnum == meshtastic_PortNum_RANGE_TEST_APP) {
+        if (isDecoded && (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
+                          p->decoded.portnum == meshtastic_PortNum_RANGE_TEST_APP)) {
             LOG_WARN("ToPhone queue is full, discard oldest");
             meshtastic_MeshPacket *d = toPhoneQueue.dequeuePtr(0);
             if (d)
